@@ -1,6 +1,9 @@
+require('dotenv').config({ path: require('path').join(__dirname, '.env') });
 const express = require('express');
+
 const path = require('path');
-const { ensureTables, pool } = require('./db');
+const { enqueueAndAutoDrain } = require('./contactStore');
+const { sendContactEmail } = require('./mailer');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -54,8 +57,7 @@ app.post('/api/contact', async (req, res) => {
   }
 
   // Email validation
-  const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
-
+  const emailOk = /^([^\s@]+)@([^\s@]+)\.([^\s@]+)$/.test(email);
   if (!emailOk) {
     return res.status(400).json({
       success: false,
@@ -72,23 +74,53 @@ app.post('/api/contact', async (req, res) => {
   }
 
   try {
-    // Save to database
-    await pool.query(
-      'INSERT INTO contact_messages (name, email, message) VALUES (?, ?, ?)',
-      [name, email, message]
+    // Enqueue for auto-send + file persistence (no DB)
+    enqueueAndAutoDrain(
+      { name, email, message, created_at: new Date().toISOString() },
+      {
+        onSend: async (item) => {
+          const to = process.env.CONTACT_TO_EMAIL;
+          if (!to) throw new Error('Missing CONTACT_TO_EMAIL in node-backend/.env');
+
+          const subject = `New Contact Message from ${item.name}`;
+          const text = `Name: ${item.name}\nEmail: ${item.email}\n\nMessage:\n${item.message}\n\nReceived at: ${item.created_at}`;
+          await sendContactEmail({
+            to: process.env.CONTACT_TO_EMAIL,
+            subject: `New Contact Message from ${name}`,
+            text: `
+            Name: ${name}
+            Email: ${email}
+
+            Message:
+            ${message}
+            `
+          });
+          await sendContactEmail({
+            to: item.email,
+            subject: 'Thank You For Contacting Us',
+            text: `Hi ${item.name},
+
+            Thank you for contacting us.
+
+            We have received your message and will get back to you within 24 hours.
+
+            Best Regards,
+            Priya`
+          });
+        }
+      }
     );
 
     return res.json({
       success: true,
       message: 'Message submitted successfully'
     });
-
   } catch (e) {
     console.error(e);
 
     return res.status(500).json({
       success: false,
-      error: 'Database error'
+      error: 'Server error'
     });
   }
 });
@@ -102,18 +134,11 @@ app.all('/api/contact', (req, res) => {
 });
 
 // Start server
-async function start() {
-  try {
-    await ensureTables();
-
-    app.listen(PORT, () => {
-      console.log(`Server running on http://localhost:${PORT}`);
-    });
-
-  } catch (err) {
-    console.error('Failed to start server:', err);
-    process.exit(1);
-  }
+function start() {
+  app.listen(PORT, () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+  });
 }
 
 start();
+
